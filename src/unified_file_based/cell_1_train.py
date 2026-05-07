@@ -43,7 +43,7 @@ config = {
     "gradient_accumulation_steps": 1, 
     "epochs": 2,
     "lr": 1e-5,
-    "max_length": 1024, # Reduced from 2048 for 2x-4x speedup (if data fits)
+    "max_length": 2048, # Reduced from 2048 for 2x-4x speedup (if data fits)
     "output_dir": "/workspace/CheckThat-checkpoints",
     "use_flash_attention": False, # Disabled as per user request
     "use_dynamic_padding": True
@@ -114,6 +114,12 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     dtype=torch.bfloat16,
     token=os.environ.get("HF_TOKEN")
 )
+
+# Fix for the specified `eos_token` ('<EOS_TOKEN>') not found error
+if tokenizer.eos_token == "<EOS_TOKEN>" or tokenizer.eos_token is None:
+    # Use the actual token mapped to the model's EOS ID
+    tokenizer.eos_token = tokenizer.decode([tokenizer.eos_token_id]) if isinstance(tokenizer.eos_token_id, int) else tokenizer.decode([tokenizer.eos_token_id[0]])
+tokenizer.pad_token = tokenizer.eos_token
 
 model = FastLanguageModel.get_peft_model(
     model,
@@ -196,7 +202,7 @@ trainer = SFTTrainer(
         weight_decay=0.01,
         lr_scheduler_type="cosine",
         seed=3407,
-        max_seq_length=config["max_length"],
+        max_length=config["max_length"],
         dataset_num_proc=2,
         packing=False,
         assistant_only_loss=True,
