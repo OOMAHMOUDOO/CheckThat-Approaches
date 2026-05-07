@@ -10,15 +10,15 @@ import time
 import datetime
 import re
 import numpy as np
-import pandas as pd
+
 import random
 import torch
 from tqdm.auto import tqdm
 from transformers import TrainerCallback
-from datasets import Dataset
+from datasets import Dataset, load_dataset
 from trl import SFTTrainer, SFTConfig
-from unsloth import FastLanguageModel, is_bfloat16_supported
-from unsloth.chat_templates import train_on_responses_only
+from peft import LoraConfig
+from transformers import AutoTokenizer
 from huggingface_hub import HfApi, login
 
 
@@ -33,7 +33,7 @@ DATA_PATH = "/content/drive/MyDrive/CheckThat-Task2"
 
 # Configuration
 config = {
-    "train_path": "/workspace/CheckThat-Task2/deepseek_audit_results_20k.jsonl.",
+    "train_path": "/workspace/CheckThat-Task2/deepseek_audit_results_20k_conversational.jsonl",
     "test_path": "/workspace/CheckThat-Task2/clef_2026_final_english_test.json",
     "model_name": "Qwen/Qwen3-4B",
     "lora_rank": 64,
@@ -60,27 +60,7 @@ if hf_token:
     print("Logged into HuggingFace")
 
 # Unified System Prompt
-SYSTEM_PROMPT = (
-    "You are an expert fact-checking auditor specializing in numerical, statistical, and temporal claims. "
-    "Your task is to rigorously evaluate whether a previous fact-checker's verdict and justification are correct, "
-    "given the original claim and retrieved evidence.\n\n"
-    "Verdict Definitions:\n"
-    "- True: The evidence fully supports the claim.\n"
-    "- False: The evidence directly contradicts the claim.\n"
-    "- Conflicting: The evidence contains contradictory elements or is inconclusive.\n\n"
-    "Evaluation Criteria:\n"
-    "1. Evidence Grounding: Does the justification accurately reflect the provided evidence without hallucination?\n"
-    "2. Numerical/Temporal Precision: Are all quantities, dates, and calculations correctly verified? Beware of the 'Numeric-Truth Effect'.\n"
-    "3. Logical Consistency: Does the reasoning chain logically support the verdict?\n"
-    "4. Verdict Alignment: Is the stated verdict consistent with the definitions above given the evidence?\n\n"
-    "Output Rules:\n"
-    "- Think step-by-step inside <think>... </think> tags.\n"
-    "- After </think>, output EXACTLY one of the following formats:\n"
-    "  • Yes, verdict is correct.\n"
-    "  • No, verdict should be [Correct Verdict].\n"
-    "- Replace [Correct Verdict] with True, False, or Conflicting.\n"
-    "- Do not output any additional text after this line."
-)
+
 
 
 
@@ -90,67 +70,47 @@ print(f"Using device: {device}")
 
 
 # --- Data Loading ---
-print("Loading processed data...")
-with open(config["train_path"], "r") as f: 
-    train_data = f.readlines()
-    train_data = [json.loads(row) for row in train_data]
+print("Loading processed data using HF datasets...")
+train_dataset = load_dataset("json", data_files=config["train_path"], split="train")
 
 if config["is_sanity"]:
     print("Sanity mode: using first few samples.")
-    train_data = train_data[:10]
+    train_dataset = train_dataset.select(range(min(10, len(train_dataset))))
 
-train_df = pd.DataFrame(train_data)
-print(f"Loaded samples - Train: {len(train_df)}")
+print(f"Loaded samples - Train: {len(train_dataset)}")
 
-# Create HF Datasets
-train_dataset = Dataset.from_pandas(train_df)
+# Filter dataset to ensure every example has an assistant response
+# This prevents RuntimeError when using assistant_only_loss=True
+def has_assistant(example):
+    return any(m.get("role") == "assistant" for m in example.get("messages", []))
+
+train_dataset = train_dataset.filter(has_assistant)
+print(f"Filtered samples - Train: {len(train_dataset)}")
 
 # --- Model & Tokenizer Setup ---
-print("Initializing model...")
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name=config["model_name"],
-    max_seq_length=config["max_length"],
-    load_in_4bit=False,
-    dtype=torch.bfloat16,
-    token=os.environ.get("HF_TOKEN")
-)
-
-# Fix for the specified `eos_token` ('<EOS_TOKEN>') not found error
-if tokenizer.eos_token == "<EOS_TOKEN>" or tokenizer.eos_token is None:
-    # Use the actual token mapped to the model's EOS ID
-    tokenizer.eos_token = tokenizer.decode([tokenizer.eos_token_id]) if isinstance(tokenizer.eos_token_id, int) else tokenizer.decode([tokenizer.eos_token_id[0]])
+print("Initializing tokenizer...")
+tokenizer = AutoTokenizer.from_pretrained(config["model_name"], trust_remote_code=True)
 tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right" # Important for training
 
-model = FastLanguageModel.get_peft_model(
-    model,
+# PEFT Configuration
+peft_config = LoraConfig(
     r=config["lora_rank"],
+    lora_alpha=config["lora_rank"] * 2,
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                     "gate_proj", "up_proj", "down_proj"],
-    lora_alpha=config["lora_rank"] * 2,
     lora_dropout=0,
     bias="none",
-    use_gradient_checkpointing="unsloth",
-    random_state=3407,
+    task_type="CAUSAL_LM",
 )
 
 # Apply Chat Template
 # Chat template is handled by the model's default tokenizer configuration
 
-def formatting_prompts_func(examples):
-    prompts = examples["input_text"]
-    completions = examples["response"]
-    texts = []
-    for p, c in zip(prompts, completions):
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": p},
-            {"role": "assistant", "content": c}
-        ]
-        texts.append(tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False))
-    return {"text": texts}
 
-print("Formatting datasets...")
-train_dataset = train_dataset.map(formatting_prompts_func, batched=True)
+
+
+
 
 # --- Trainer Setup ---
 output_dir_full = os.path.join(config["output_dir"], config["experiment_name"])
@@ -183,32 +143,39 @@ callbacks_list = [
     PushLoRACallback(hf_token=os.environ.get('HF_TOKEN'), base_repo_name=config["experiment_name"], save_steps=1000)
 ]
 
+
+# --- Modern SFT Setup ---
+sft_args = SFTConfig(
+    output_dir=config["output_dir"],
+    per_device_train_batch_size=config["batch_size"],
+    gradient_accumulation_steps=config["gradient_accumulation_steps"],
+    learning_rate=config["lr"],
+    num_train_epochs=config["epochs"],
+    max_length=config["max_length"],
+    
+    # THE REPLACEMENT FOR DataCollatorForCompletionOnlyLM
+    # This automatically masks user/system tokens in the loss
+    assistant_only_loss=True, 
+    
+    # Precision settings
+    bf16=torch.cuda.is_bf16_supported(),
+    fp16=not torch.cuda.is_bf16_supported(),
+    
+    logging_steps=10,
+    save_strategy="steps",
+    save_steps=500,
+    optim="adamw_torch_fused", # Faster for 4B+ models
+    report_to="none",
+)
+
 print("Initializing SFTTrainer...")
+
 trainer = SFTTrainer(
-    model=model,
-    args=SFTConfig(
-        per_device_train_batch_size=config["batch_size"],
-        gradient_accumulation_steps=config["gradient_accumulation_steps"],
-        warmup_ratio=0.05,
-        num_train_epochs=config["epochs"],
-        learning_rate=float(config["lr"]),
-        fp16=not is_bfloat16_supported(),
-        bf16=is_bfloat16_supported(),
-        logging_steps=10,
-        save_steps=1000,
-        output_dir=output_dir_full,
-        dataloader_num_workers=4,
-        optim="adamw_8bit",
-        weight_decay=0.01,
-        lr_scheduler_type="cosine",
-        seed=3407,
-        max_length=config["max_length"],
-        dataset_num_proc=2,
-        packing=False,
-        assistant_only_loss=True,
-    ),
+    model=config["model_name"],
     train_dataset=train_dataset,
+    peft_config=peft_config,
     processing_class=tokenizer,
+    args=sft_args,
     callbacks=callbacks_list
 )
 
@@ -224,8 +191,7 @@ if token:
     try:
         api = HfApi()
         repo_id = f"{api.whoami(token=token)['name']}/{config['experiment_name']}"
-        model.push_to_hub(repo_id, token=token)
-        tokenizer.push_to_hub(repo_id, token=token)
+        trainer.push_to_hub(repo_id, token=token)
         print(f"Successfully uploaded to Hub: {repo_id}")
     except Exception as e:
         print(f"Failed to upload to Hugging Face: {e}")
