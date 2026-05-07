@@ -1,0 +1,49 @@
+run_config:
+  is_sanity: false
+
+paths:
+  # Base directory for local processing/synthesis
+  base_dir: "c:/Users/mahmoud/Downloads/Code/data"
+
+  # Source JSON files used for synthesis (cell_0)
+  source_val_json: "c:/Users/mahmoud/Downloads/Code/data/clef2026_gpt4_o_mini_val.json"
+  source_train_json: "C:\\Users\\mahmoud\\Downloads\\clef_2026_checkthat_english_train.json"
+  source_test_json: "c:/Users/mahmoud/Downloads/Code/data/clef_2026_checkthat_english_test.json"
+  # Outputs from DeepSeek synthesis
+  deepseek_audit_output: "D:\\CheckThat-Approaches\\deepseek_audit_results.jsonl"
+
+  # Final SFT unified files (consumed by cell_1)
+  unified_sft_train: "/workspace/CheckThat-Task2/unified_sft_train.json"
+  unified_sft_val: "/workspace/CheckThat-Task2/unified_sft_val.json"
+
+  # Log file for step-by-step generations
+  generation_log: "./generation_log.log"
+
+  # Checkpoint saving directory
+  output_dir: "./checkpoints_sft"
+
+synthesis:
+  model_name: "deepseek-v4-flash"
+  temperature: 0.0
+  max_tokens: 320
+  concurrency_limit: 200
+
+training:
+  model_id: "Qwen/Qwen3-0.6B"
+  max_seq_length: 1024
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 4
+  num_train_epochs: 2
+  learning_rate: 5.0e-05
+  optim: "adamw_8bit"
+  logging_steps: 10
+  save_steps: 1000
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+
+credentials:
+  hf_token: "" # Leave empty to use env variables or HuggingFace login cache
+  deepseek_api_key: "" # Leave empty to use os.environ.get("DEEPSEEK_API_KEY")
