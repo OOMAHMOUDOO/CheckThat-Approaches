@@ -18,7 +18,7 @@ from transformers import TrainerCallback
 from datasets import Dataset, load_dataset
 from trl import SFTTrainer, SFTConfig
 from peft import LoraConfig
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from huggingface_hub import HfApi, login
 
 
@@ -33,20 +33,17 @@ DATA_PATH = "/content/drive/MyDrive/CheckThat-Task2"
 
 # Configuration
 config = {
-    "train_path": "/workspace/CheckThat-Task2/deepseek_audit_results_20k_conversational.jsonl",
-    "test_path": "/workspace/CheckThat-Task2/clef_2026_final_english_test.json",
-    "model_name": "Qwen/Qwen3-4B",
-    "lora_rank": 64,
-    "experiment_name": "clef-distill-ds-lr-64-qwen3-4b",
-    "is_sanity": True,  # Set to False for full run
-    "batch_size": 64, # Better balance for CPU/GPU throughput
-    "gradient_accumulation_steps": 1, 
-    "epochs": 2,
-    "lr": 1e-5,
-    "max_length": 2048, # Reduced from 2048 for 2x-4x speedup (if data fits)
-    "output_dir": "/workspace/CheckThat-checkpoints",
-    "use_flash_attention": False, # Disabled as per user request
-    "use_dynamic_padding": True
+    "dataset_name": "Mahmoud669401/my-ds-clef-20-chat-dataset", # Updated as per recent upload
+    "model_name": "Qwen/Qwen3-4B-Instruct",
+    "lora_rank": 16,
+    "experiment_name": "qwen3-4b-sft-clef",
+    "is_sanity": False, 
+    "batch_size": 1,
+    "gradient_accumulation_steps": 8, 
+    "epochs": 1,
+    "lr": 2e-4,
+    "max_length": 2048,
+    "output_dir": "./qwen3-4b-sft",
 }
 
 if config.get("is_sanity"):
@@ -70,37 +67,50 @@ print(f"Using device: {device}")
 
 
 # --- Data Loading ---
-print("Loading processed data using HF datasets...")
-train_dataset = load_dataset("json", data_files=config["train_path"], split="train")
+print(f"Loading dataset from Hub: {config['dataset_name']}")
+dataset = load_dataset(config["dataset_name"], split="train")
 
 if config["is_sanity"]:
     print("Sanity mode: using first few samples.")
-    train_dataset = train_dataset.select(range(min(10, len(train_dataset))))
+    dataset = dataset.select(range(min(10, len(dataset))))
 
-print(f"Loaded samples - Train: {len(train_dataset)}")
+print(f"Loaded samples: {len(dataset)}")
 
 # Filter dataset to ensure every example has an assistant response
 # This prevents RuntimeError when using assistant_only_loss=True
 def has_assistant(example):
     return any(m.get("role") == "assistant" for m in example.get("messages", []))
 
-train_dataset = train_dataset.filter(has_assistant)
+train_dataset = dataset.filter(has_assistant)
 print(f"Filtered samples - Train: {len(train_dataset)}")
 
 # --- Model & Tokenizer Setup ---
-print("Initializing tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained(config["model_name"], trust_remote_code=True)
+print(f"Loading tokenizer and model: {config['model_name']}")
+tokenizer = AutoTokenizer.from_pretrained(
+    config["model_name"], 
+    trust_remote_code=True
+)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right" # Important for training
+
+model = AutoModelForCausalLM.from_pretrained(
+    config["model_name"],
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    trust_remote_code=True
+)
 
 # PEFT Configuration
 peft_config = LoraConfig(
     r=config["lora_rank"],
     lora_alpha=config["lora_rank"] * 2,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                    "gate_proj", "up_proj", "down_proj"],
-    lora_dropout=0,
-    bias="none",
+    lora_dropout=0.05,
+    target_modules=[
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+    ],
     task_type="CAUSAL_LM",
 )
 
@@ -151,31 +161,30 @@ sft_args = SFTConfig(
     gradient_accumulation_steps=config["gradient_accumulation_steps"],
     learning_rate=config["lr"],
     num_train_epochs=config["epochs"],
-    max_length=config["max_length"],
-    
-    # THE REPLACEMENT FOR DataCollatorForCompletionOnlyLM
-    # This automatically masks user/system tokens in the loss
-    assistant_only_loss=True, 
-    
-    # Precision settings
-    bf16=torch.cuda.is_bf16_supported(),
-    fp16=not torch.cuda.is_bf16_supported(),
-    
     logging_steps=10,
+
+    # important
+    assistant_only_loss=True,
+
+    # recommended
+    bf16=True,
+    packing=True,
+    max_seq_length=config["max_length"],
+    
     save_strategy="steps",
     save_steps=500,
-    optim="adamw_torch_fused", # Faster for 4B+ models
+    optim="adamw_torch_fused",
     report_to="none",
 )
 
 print("Initializing SFTTrainer...")
 
 trainer = SFTTrainer(
-    model=config["model_name"],
-    train_dataset=train_dataset,
-    peft_config=peft_config,
-    processing_class=tokenizer,
+    model=model,
     args=sft_args,
+    train_dataset=train_dataset,
+    processing_class=tokenizer,
+    peft_config=peft_config,
     callbacks=callbacks_list
 )
 
