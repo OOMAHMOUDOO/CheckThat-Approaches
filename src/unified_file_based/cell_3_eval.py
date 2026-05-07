@@ -10,6 +10,16 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
+import spacy
+import nltk
+from nltk import pos_tag, word_tokenize
+from collections import defaultdict
+
+# Setup NLTK
+nltk.download('punkt', quiet=True)
+nltk.download('averaged_perceptron_tagger', quiet=True)
+nltk.download('punkt_tab', quiet=True)
 
 # --- Configuration ---
 DATA_PATH = "/content/drive/MyDrive/CheckThat-Task2"
@@ -26,13 +36,61 @@ config = {
 }
 
 SYSTEM_PROMPT = (
-    "You are an expert fact-checking auditor. Your job is to evaluate whether a previous fact-checker's verdict and justification are correct given the claim and retrieved documents.\n\n"
-    "You only respond with Yes or No, Yes if the Claim checker's Verdict and Justification are correct, No if they are incorrect\n /no_think"
+    "You are an expert fact-checking auditor specializing in numerical, statistical, and temporal claims. "
+    "Your task is to rigorously evaluate whether a previous fact-checker's verdict and justification are correct, "
+    "given the original claim and retrieved evidence.\n\n"
+    "Verdict Definitions:\n"
+    "- True: The evidence fully supports the claim.\n"
+    "- False: The evidence directly contradicts the claim.\n"
+    "- Conflicting: The evidence contains contradictory elements or is inconclusive.\n\n"
+    "Evaluation Criteria:\n"
+    "1. Evidence Grounding: Does the justification accurately reflect the provided evidence without hallucination?\n"
+    "2. Numerical/Temporal Precision: Are all quantities, dates, and calculations correctly verified? Beware of the 'Numeric-Truth Effect'.\n"
+    "3. Logical Consistency: Does the reasoning chain logically support the verdict?\n"
+    "4. Verdict Alignment: Is the stated verdict consistent with the definitions above given the evidence?\n\n"
+    "Output Rules:\n"
+    "- Think step-by-step inside <think>... </think> tags.\n"
+    "- After </think>, output EXACTLY one of the following formats:\n"
+    "  • Yes, verdict is correct.\n"
+    "  • No, verdict should be [Correct Verdict].\n"
+    "- Replace [Correct Verdict] with True, False, or Conflicting.\n"
+    "- Do not output any additional text after this line."
+)
+
+USER_TEMPLATE = (
+    "### Claim:\n{claim}\n\n"
+    "### Extracted Context (NER & Verbs):\nPersons: {persons}\nPlaces: {places}\nVerbs: {verbs}\n\n"
+    "### Retrieved Evidence:\n{evidence}\n\n"
+    "### Previous Verdict:\n{verdict}\n\n"
+    "### Previous Justification:\n{justification}\n\n"
+    "Audit this verdict and justification according to the criteria and definitions. "
+    "Provide your reasoning in <think> tags, then output your final assessment in the exact required format."
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- Utilities ---
+# Load spacy for NER
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    print("Downloading spacy model en_core_web_sm...")
+    from spacy.cli import download
+    download("en_core_web_sm")
+    nlp = spacy.load("en_core_web_sm")
+
+def extract_entities_and_verbs(text):
+    if not text:
+        return "None", "None", "None"
+    doc = nlp(text)
+    persons = set([ent.text for ent in doc.ents if ent.label_ == "PERSON"])
+    places = set([ent.text for ent in doc.ents if ent.label_ in ("GPE", "LOC")])
+    
+    tokens = word_tokenize(text)
+    tags = pos_tag(tokens)
+    verbs = set([word for word, tag in tags if tag.startswith('VB')])
+    
+    return ", ".join(persons) or "None", ", ".join(places) or "None", ", ".join(verbs) or "None"
+
 def remove_label_pattern(text):
     text = re.sub(
         r"(\[?\s*Justification\s*\]?:?\s*)|(\[Label\]:\s*(True|False|Conflicting))",
@@ -40,50 +98,7 @@ def remove_label_pattern(text):
     ).strip()
     return text.replace("\n", " ")
 
-class CustomClassifier(torch.nn.Module):
-    def __init__(self, model_name, tokenizer, token=None, adapter_path=None, use_flash_attention=False):
-        super().__init__()
-        attn_implementation = "flash_attention_2" if use_flash_attention else "eager"
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            attn_implementation=attn_implementation,
-            device_map="auto",
-            token=token
-        )
-        self.yes_token_id = tokenizer.convert_tokens_to_ids("Yes")
-        self.no_token_id = tokenizer.convert_tokens_to_ids("No")
-
-        if adapter_path:
-            from peft import PeftModel
-            self.model = PeftModel.from_pretrained(self.model, adapter_path)
-            print(f"Loaded LoRA adapters from {adapter_path}")
-        else:
-            print("Warning: No adapter path provided. Using base model.")
-
-    def forward(self, input_ids, attention_mask):
-        # Optimized Forward Pass: Extract only the hidden state of the last token
-        # This prevents the "Logit Explosion" (saving ~10GB VRAM at large vocab/batch sizes)
-
-        # Access the underlying transformer model (Qwen/Llama structure)
-        # self.model is the PeftModel wrapping the ForCausalLM model
-        base_model = self.model.get_base_model()
-
-        # 1. Get hidden states from the backbone transformer
-        transformer_outputs = base_model.model(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = transformer_outputs[0] # [batch, seq_len, hidden_size]
-
-        # 2. Extract ONLY the last token's hidden state
-        last_token_hidden = hidden_states[:, -1, :] # [batch, hidden_size]
-
-        # 3. Pass only that single hidden state through the LM head
-        last_token_logits = base_model.lm_head(last_token_hidden) # [batch, vocab_size]
-
-        # 4. Pull out our target Yes/No tokens
-        target_logits = last_token_logits[:, [self.no_token_id, self.yes_token_id]]
-        return target_logits
-
-class VerifierEvaluator:
+class ProbabilisticEvaluator:
     def __init__(self, model, tokenizer, device, use_dynamic_padding=True):
         self.model = model
         self.tokenizer = tokenizer
@@ -91,76 +106,151 @@ class VerifierEvaluator:
         self.use_dynamic_padding = use_dynamic_padding
         self.model.eval()
 
-    def score_batch(self, claims, verdicts, justifications, max_length=2048):
-        texts = []
-        for c, v, j in zip(claims, verdicts, justifications):
-            input_text = f"Claim: {c}\nVerdict: {v}\nJustification: {j}"
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": input_text}
-            ]
-            text = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
-            )
-            texts.append(text)
-
+    def score_candidates_batch(self, batch_prompts, batch_candidates):
+        texts = [p + c for p, c in zip(batch_prompts, batch_candidates)]
+        
         padding_strategy = True if self.use_dynamic_padding else "max_length"
         encoding = self.tokenizer(
             texts, truncation=True, padding=padding_strategy,
-            max_length=max_length, return_tensors="pt"
+            max_length=2048, return_tensors="pt"
         )
-        ids = encoding["input_ids"].to(self.device)
-        mask = encoding["attention_mask"].to(self.device)
+        input_ids = encoding["input_ids"].to(self.device)
+        attention_mask = encoding["attention_mask"].to(self.device)
+        
+        prompt_encoding = self.tokenizer(batch_prompts, padding=False, truncation=True)
+        prompt_lengths = [len(ids) for ids in prompt_encoding["input_ids"]]
+        
         with torch.no_grad():
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                logits = self.model(ids, mask)
-                return logits[:, 1].tolist()
+                outputs = self.model(input_ids, attention_mask=attention_mask)
+                logits = outputs.logits
+                
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = input_ids[..., 1:].contiguous()
+        shift_mask = attention_mask[..., 1:].contiguous()
+        
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+        losses = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        losses = losses.view(shift_labels.size()) 
+        
+        scores = []
+        for i in range(len(batch_prompts)):
+            p_len = prompt_lengths[i]
+            valid_len = shift_mask[i].sum().item()
+            
+            if valid_len <= p_len - 1:
+                scores.append(-9999.0)
+                continue
+                
+            candidate_loss = losses[i, p_len-1:valid_len].sum().item()
+            scores.append(-candidate_loss)
+            
+        return scores
 
-def run_test_evaluation(evaluator, raw_data, batch_size=8):
-    flat_inputs = []
-    flat_indices = []
-    for idx, sample in enumerate(raw_data):
+def run_test_evaluation(evaluator, tokenizer, raw_data, batch_size=8):
+    flat_prompts = []
+    flat_candidates = []
+    flat_meta = []
+    
+    for idx, sample in enumerate(tqdm(raw_data, desc="Preparing Prompts")):
+        claim = sample.get("claim", "")
+        evidence = sample.get("evidence", sample.get("documents", "No evidence provided."))
+        combined_text = f"{claim} {evidence}"
+        persons, places, verbs = extract_entities_and_verbs(combined_text)
+        
         for t_idx, trace in enumerate(sample["Reasoning_traces"]):
             justification = remove_label_pattern(trace).split("Label:")[0].strip()
-            flat_inputs.append({
-                "claim": sample["claim"],
-                "verdict": sample["Verdict_list"][t_idx],
-                "justification": justification
-            })
-            flat_indices.append((idx, t_idx))
+            v = sample["Verdict_list"][t_idx].lower()
+            
+            user_input = USER_TEMPLATE.format(
+                claim=claim,
+                persons=persons,
+                places=places,
+                verbs=verbs,
+                evidence=evidence,
+                verdict=v.capitalize(),
+                justification=justification
+            )
+            
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_input}
+            ]
+            
+            prompt_text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            
+            c_yes = f"<think>\nThe previous justification logic correctly reflects the evidence to conclude {v.capitalize()}.\n</think>\nYes, verdict is correct."
+            candidates = [(c_yes, v)]
+            
+            for possible_label in ["true", "false", "conflicting"]:
+                if possible_label != v:
+                    c_no = f"<think>\nThe previous justification is flawed. The evidence actually supports the conclusion of {possible_label.capitalize()}.\n</think>\nNo, verdict should be {possible_label.capitalize()}."
+                    candidates.append((c_no, possible_label))
+            
+            for c_text, c_label in candidates:
+                flat_prompts.append(prompt_text)
+                flat_candidates.append(c_text)
+                flat_meta.append({
+                    "sample_idx": idx,
+                    "trace_idx": t_idx,
+                    "cand_label": c_label,
+                })
 
+    print("Running Probabilistic Evaluation...")
     all_scores = []
-    batch_size_eval = config["batch_size"]
-    for i in tqdm(range(0, len(flat_inputs), batch_size_eval), desc="Test Evaluation"):
-        batch = flat_inputs[i:i+batch_size_eval]
-        scores = evaluator.score_batch(
-            [b["claim"] for b in batch],
-            [b["verdict"] for b in batch],
-            [b["justification"] for b in batch]
-        )
+    for i in tqdm(range(0, len(flat_prompts), batch_size), desc="Scoring Batches"):
+        b_prompts = flat_prompts[i:i+batch_size]
+        b_cands = flat_candidates[i:i+batch_size]
+        scores = evaluator.score_candidates_batch(b_prompts, b_cands)
         all_scores.extend(scores)
 
-    results = [{"scores": []} for _ in range(len(raw_data))]
-    for score, (sample_idx, _) in zip(all_scores, flat_indices):
-        results[sample_idx]["scores"].append(score)
+    trace_scores = defaultdict(list)
+    for score, meta in zip(all_scores, flat_meta):
+        s_idx = meta["sample_idx"]
+        t_idx = meta["trace_idx"]
+        trace_scores[(s_idx, t_idx)].append({
+            "label": meta["cand_label"],
+            "score": score
+        })
+        
+    sample_votes = [{"true": 0.0, "false": 0.0, "conflicting": 0.0} for _ in range(len(raw_data))]
+    sample_scores_list = [[] for _ in range(len(raw_data))]
+    
+    for (s_idx, t_idx), scores_list in trace_scores.items():
+        scores_tensor = torch.tensor([item["score"] for item in scores_list])
+        probs = torch.softmax(scores_tensor, dim=0).tolist()
+        
+        trace_vote_sum = 0
+        for i, item in enumerate(scores_list):
+            label = item["label"]
+            prob = probs[i]
+            sample_votes[s_idx][label] += prob
+            if i == 0: 
+                trace_vote_sum = prob
+                
+        sample_scores_list[s_idx].append(trace_vote_sum)
 
     predictions = []
     for idx, sample in enumerate(raw_data):
-        s_list = results[idx]["scores"]
-        #print(f"{len(sample['Reasoning_traces'])} and {len(s_list)}")
-        best_trace_idx = np.argmax(s_list)
-        best_verdict = sample["Verdict_list"][best_trace_idx]
-
-        # Structure requested by user
+        votes = sample_votes[idx]
+        s_list = sample_scores_list[idx]
+        
+        best_verdict = max(votes, key=votes.get)
+        
         predictions.append({
             "query_id": idx,
             "Claim": sample["claim"],
-            #"Label": best_verdict, # As requested: produce Label the same as Verdict_BoN
-            "Verdict_BoN": best_verdict,
+            "Verdict_BoN": best_verdict.capitalize(),
             "BoN_Verdict_list": sample["Verdict_list"],
             "Reasoning_traces": sample["Reasoning_traces"],
-            "score_list": s_list
+            "score_list": s_list,
+            "votes": votes
         })
+        
     return predictions
 
 # --- Timed Input Logic ---
@@ -216,13 +306,23 @@ print(f"Loading base model and adapter: {chosen_adapter}")
 tokenizer = AutoTokenizer.from_pretrained(config["model_name"])
 tokenizer.pad_token = tokenizer.eos_token
 
-model = CustomClassifier(
-    config["model_name"], tokenizer,
-    token=os.environ.get("HF_TOKEN"), adapter_path=chosen_adapter,
-    use_flash_attention=config["use_flash_attention"]
+print("Loading base model into memory...")
+base_model = AutoModelForCausalLM.from_pretrained(
+    config["model_name"],
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    token=os.environ.get("HF_TOKEN")
 )
+
+if chosen_adapter and os.path.exists(chosen_adapter):
+    print(f"Applying LoRA adapters from {chosen_adapter}")
+    model = PeftModel.from_pretrained(base_model, chosen_adapter)
+else:
+    print("Warning: No adapter path found. Using base model.")
+    model = base_model
+
 model.to(device)
-evaluator = VerifierEvaluator(model, tokenizer, device, use_dynamic_padding=config["use_dynamic_padding"])
+evaluator = ProbabilisticEvaluator(model, tokenizer, device, use_dynamic_padding=config["use_dynamic_padding"])
 
 print("Loading test data...")
 with open(config["test_path"], "r") as f:
@@ -232,7 +332,7 @@ if config["is_sanity"]:
     print("Sanity mode: using first 10 samples.")
     test_raw = test_raw[:10]
 
-test_predictions = run_test_evaluation(evaluator, test_raw)
+test_predictions = run_test_evaluation(evaluator, tokenizer, test_raw, batch_size=config["batch_size"])
 
 # Save results with random number
 rand_num = random.randint(1000, 9999)
