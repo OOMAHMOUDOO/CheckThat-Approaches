@@ -227,29 +227,45 @@ class TrainerModule:
         self.output_dir = os.path.join(config["output_dir"], self.exp_name)
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def save_checkpoint(self, epoch):
+    def save_checkpoint(self, epoch, step=None):
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        checkpoint_name = f"{self.exp_name}_{timestamp}_epoch_{epoch}"
+        suffix = f"epoch_{epoch}" if step is None else f"epoch_{epoch}_step_{step}"
+        checkpoint_name = f"{self.exp_name}_{timestamp}_{suffix}"
         save_path = os.path.join(self.config["output_dir"], checkpoint_name)
-        os.makedirs(save_path, exist_ok=True)
-
-        print(f"Saving checkpoint to local Drive: {save_path}")
-        # Unsloth models save standard Peft-compatible adapters
-        self.model.save_pretrained(save_path)
-        self.tokenizer.save_pretrained(save_path)
-        return save_path
-
-    def upload_to_hf(self, epoch, local_path):
+        
         try:
-            repo_id = f"{self.api.whoami(token=os.environ.get('HF_TOKEN'))['name']}/{self.exp_name}-epoch-{epoch}"
-            print(f"Uploading checkpoint for epoch {epoch} to Hub: {repo_id}")
+            os.makedirs(save_path, exist_ok=True)
+            print(f"Saving checkpoint to local Drive: {save_path}")
+            # Unsloth models save standard Peft-compatible adapters
+            # Fix: Use self.model.model to access the underlying PeftModel for saving
+            self.model.model.save_pretrained(save_path)
+            self.tokenizer.save_pretrained(save_path)
+            return save_path
+        except Exception as e:
+            print(f"Failed to save checkpoint locally: {e}")
+            return None
+
+    def upload_to_hf(self, epoch, local_path, step=None):
+        try:
+            token = os.environ.get('HF_TOKEN')
+            if not token:
+                print("HF_TOKEN not found, skipping upload.")
+                return
+
+            suffix = f"-epoch-{epoch}" if step is None else f"-epoch-{epoch}-step-{step}"
+            repo_id = f"{self.api.whoami(token=token)['name']}/{self.exp_name}{suffix}"
+            
+            print(f"Uploading checkpoint to Hub: {repo_id}")
             # Push the Unsloth/Peft adapters
-            self.model.push_to_hub(repo_id, token=os.environ.get("HF_TOKEN"))
+            # Fix: Use self.model.model to access the underlying PeftModel for uploading
+            self.model.model.push_to_hub(repo_id, token=token)
+            self.tokenizer.push_to_hub(repo_id, token=token)
             print(f"Successfully uploaded to Hub: {repo_id}")
         except Exception as e:
-            print(f"Skipping HF upload: {e}")
+            print(f"Skipping/Failed HF upload: {e}")
 
     def train(self):
+        global_step = 0
         for epoch in range(self.config["epochs"]):
             print(f"\nEpoch {epoch+1}/{self.config['epochs']}")
             self.model.train()
@@ -273,6 +289,17 @@ class TrainerModule:
                     self.optimizer.step()
                     self.scheduler.step()
                     self.optimizer.zero_grad()
+                    global_step += 1
+
+                    # Save and upload every 1000 steps
+                    if global_step % 1000 == 0:
+                        print(f"\n[Step {global_step}] Saving checkpoint...")
+                        try:
+                            local_path = self.save_checkpoint(epoch, step=global_step)
+                            if local_path:
+                                self.upload_to_hf(epoch, local_path, step=global_step)
+                        except Exception as e:
+                            print(f"Error during step saving/uploading: {e}")
 
                 total_loss += loss.item() * self.grad_acc_steps
                 preds = torch.argmax(logits, dim=-1).cpu().numpy()
@@ -281,10 +308,14 @@ class TrainerModule:
             print(f"Train Loss: {total_loss/len(self.train_loader):.4f} | Train Acc: {total_acc/len(self.train_loader):.4f}")
             self.evaluate(epoch)
 
-            # Save checkpoint locally first
-            local_path = self.save_checkpoint(epoch)
-            # Then optionally upload
-            self.upload_to_hf(epoch, local_path)
+            try:
+                # Save checkpoint locally first
+                local_path = self.save_checkpoint(epoch)
+                # Then optionally upload
+                if local_path:
+                    self.upload_to_hf(epoch, local_path)
+            except Exception as e:
+                print(f"Error during epoch saving/uploading: {e}")
 
             # Clear cache
             torch.cuda.empty_cache()

@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-%%writefile cell3.py
+
 
 import os
 import json
@@ -15,12 +14,12 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # --- Configuration ---
 DATA_PATH = "/content/drive/MyDrive/CheckThat-Task2"
 config = {
-    "test_path": "/content/CheckThat-Task2/clef_2026_final_arabic_test.json",
-    "model_name": "Qwen/Qwen3-4B",
-    "experiment_name": "clef-fact-check-grm-qwen3-4b-full-dataset-lora-8",
+    "test_path": "/content/drive/MyDrive/CheckThat-Task2/clef_2026_final_english_test.json",
+    "model_name": "Qwen/Qwen3-0.6B",
+    "experiment_name": "clef-fact-check-grm-qwen3-06b-full-dataset-lora-16-en-unsloth",
     "output_dir": "/content/drive/MyDrive/CheckThat-checkpoints",
     "batch_size": 256,
-    "max_length": 2048,
+    "max_length": 1024,
     "is_sanity": False, # Usually False for final test set
     "use_flash_attention": False,
     "use_dynamic_padding": True
@@ -148,7 +147,7 @@ def run_test_evaluation(evaluator, raw_data, batch_size=8):
     predictions = []
     for idx, sample in enumerate(raw_data):
         s_list = results[idx]["scores"]
-        print(f"{len(sample['Reasoning_traces'])} and {len(s_list)}")
+        #print(f"{len(sample['Reasoning_traces'])} and {len(s_list)}")
         best_trace_idx = np.argmax(s_list)
         best_verdict = sample["Verdict_list"][best_trace_idx]
 
@@ -156,7 +155,7 @@ def run_test_evaluation(evaluator, raw_data, batch_size=8):
         predictions.append({
             "query_id": idx,
             "Claim": sample["claim"],
-            "Label": best_verdict, # As requested: produce Label the same as Verdict_BoN
+            #"Label": best_verdict, # As requested: produce Label the same as Verdict_BoN
             "Verdict_BoN": best_verdict,
             "BoN_Verdict_list": sample["Verdict_list"],
             "Reasoning_traces": sample["Reasoning_traces"],
@@ -237,12 +236,14 @@ test_predictions = run_test_evaluation(evaluator, test_raw)
 
 # Save results with random number
 rand_num = random.randint(1000, 9999)
-output_filename = f"clef_predictions_test_{rand_num}.json"
-output_path = os.path.join(chosen_adapter if os.path.exists(chosen_adapter) else ".", output_filename)
-
+#output_filename = f"clef_predictions_test_{rand_num}_unsloth_qwen306_{chosen_adapter}.json"
+chosen_adapter_name = chosen_adapter
+if "/" in chosen_adapter_name:
+  chosen_adapter_name = chosen_adapter_name.split("/")[-1]
+output_path = f"/content/clef_predictions_test_{rand_num}_unsloth_qwen306_{chosen_adapter_name}_.json"
+#os.makedirs(output_path, exist_ok=True)
 with open(output_path, "w") as f:
     json.dump(test_predictions, f, indent=4)
 
 print(f"\nTest evaluation complete. Results saved to: {output_path}")
 print(f"Produced {len(test_predictions)} predictions.")
-

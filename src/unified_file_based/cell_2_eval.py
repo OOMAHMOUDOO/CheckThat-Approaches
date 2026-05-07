@@ -1,6 +1,4 @@
 # -*- coding: utf-8 -*-
-%%writefile cell2.py
-# -*- coding: utf-8 -*-
 """
 Cell 2: Evaluation Phase
 Asks for LoRA checkpoint path, waits 50s, then runs eval on test set.
@@ -22,12 +20,12 @@ from sklearn.metrics import classification_report
 # --- Configuration (Should match Cell 1) ---
 DATA_PATH = "/content/drive/MyDrive/CheckThat-Task2"
 config = {
-    "test_path": "/content/CheckThat-Task2/clef2026_gpt4_o_mini_val_arabic.json",
-    "model_name": "Qwen/Qwen3-4B",
-    "experiment_name": "clef-fact-check-grm-qwen3-4b-full-dataset-lora-8",
+    "test_path": "/content/drive/MyDrive/CheckThat-Task2/clef2026_gpt4_o_mini_val_english.json",
+    "model_name": "Qwen/Qwen3-0.6B",
+    "experiment_name": "clef-fact-check-grm-qwen3-06b-full-dataset-lora-16-en-unsloth",
     "output_dir": "/content/drive/MyDrive/CheckThat-checkpoints",
-    "batch_size": 32,
-    "max_length": 2048,
+    "batch_size": 256,
+    "max_length": 1024,
     "is_sanity": False, # Set to False for full evaluation
     "use_flash_attention": False,
     "use_dynamic_padding": True
@@ -304,8 +302,11 @@ test_predictions = run_full_evaluation(evaluator, test_raw)
 
 # Save results with random number
 rand_num = random.randint(1000, 9999)
-output_filename = f"clef_predictions_test_{rand_num}.json"
-output_path = os.path.join(chosen_adapter if os.path.exists(chosen_adapter) else ".", output_filename)
+#output_filename = f"clef_predictions_test_{rand_num}_unsloth_qwen306_{chosen_adapter}.json"
+chosen_adapter_name = chosen_adapter
+if "/" in chosen_adapter_name:
+  chosen_adapter_name = chosen_adapter_name.split("/")[-1]
+output_path = f"/content/clef_predictions_val_{rand_num}_unsloth_qwen306_{chosen_adapter_name}_.json"
 
 with open(output_path, "w") as f:
     json.dump(test_predictions, f, indent=4)
@@ -320,4 +321,3 @@ print(classification_report(y_true, y_pred, zero_division=0))
 for k in [1, 3, 5]:
     r_k = calculate_recall_at_k(test_predictions, k)
     print(f"Recall@{k}: {r_k:.4f}")
-
