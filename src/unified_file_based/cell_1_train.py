@@ -17,7 +17,7 @@ from tqdm.auto import tqdm
 from transformers import TrainerCallback
 from datasets import Dataset, load_dataset
 from trl import SFTTrainer, SFTConfig
-from peft import LoraConfig
+from peft import LoraConfig, PeftModel
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from huggingface_hub import HfApi, login
 
@@ -36,7 +36,7 @@ config = {
     "dataset_name": "Mahmoud669401/my-ds-clef-20-chat-dataset", # Updated as per recent upload
     "model_name": "Qwen/Qwen3-4B-Instruct",
     "lora_rank": 16,
-    "experiment_name": "qwen3-4b-sft-clef",
+    "experiment_name": "qwen3-4b-sft-clef-cont",
     "is_sanity": False, 
     "batch_size": 1,
     "gradient_accumulation_steps": 8, 
@@ -44,6 +44,7 @@ config = {
     "lr": 2e-4,
     "max_length": 2048,
     "output_dir": "./qwen3-4b-sft",
+    "resume_checkpoint": "Mahmoud669401/meta-3b-sft-clef-20k", # e.g., "username/checkpoint-name"
 }
 
 if config.get("is_sanity"):
@@ -114,6 +115,19 @@ peft_config = LoraConfig(
     task_type="CAUSAL_LM",
 )
 
+# --- Handle Resuming from Checkpoint ---
+if config.get("resume_checkpoint"):
+    print(f"Loading existing LoRA adapter from: {config['resume_checkpoint']}")
+    model = PeftModel.from_pretrained(
+        model,
+        config["resume_checkpoint"],
+        is_trainable=True,
+        token=hf_token
+    )
+    sft_peft_config = None  # Trainer doesn't need peft_config if model is already PeftModel
+else:
+    sft_peft_config = peft_config
+
 # Apply Chat Template
 # Chat template is handled by the model's default tokenizer configuration
 
@@ -147,10 +161,52 @@ class PushLoRACallback(TrainerCallback):
             except Exception as e:
                 print(f"\n[PushLoRACallback] Error pushing to Hub: {e}\n")
 
+class InferenceCallback(TrainerCallback):
+    def __init__(self, tokenizer, dataset, log_path="inference_training.log", steps=100):
+        self.tokenizer = tokenizer
+        self.log_path = log_path
+        self.steps = steps
+        # Sample 1 item to track
+        self.samples = dataset.select(range(min(1, len(dataset))))
 
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.steps == 0 and state.global_step > 0:
+            model = kwargs.get("model")
+            tokenizer = self.tokenizer
+            model.eval()
+            
+            print(f"\n--- Step {state.global_step} Periodic Inference ---")
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n\n--- Step {state.global_step} ---\n")
+                
+                for i, example in enumerate(self.samples):
+                    # Filter messages to exclude the final assistant response we're training on
+                    messages = [m for m in example["messages"] if m["role"] in ["system", "user"]]
+                    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                    
+                    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+                    
+                    with torch.no_grad():
+                        outputs = model.generate(
+                            **inputs,
+                            max_new_tokens=512,
+                            do_sample=False,
+                            stop_strings=["</think>"],
+                            tokenizer=tokenizer,
+                        )
+                    
+                    prompt_len = inputs["input_ids"].shape[1]
+                    gen_text = tokenizer.decode(outputs[0][prompt_len:], skip_special_tokens=True)
+                    
+                    out_str = f"\nSample {i}:\nPrompt Snippet: ...{prompt[-150:]}\nResponse: {gen_text}\n{'-'*40}"
+                    print("\033[31m" + out_str+ "\033[0m")
+                    f.write(out_str)
+            
+            model.train()
 
 callbacks_list = [
-    PushLoRACallback(hf_token=os.environ.get('HF_TOKEN'), base_repo_name=config["experiment_name"], save_steps=1000)
+    PushLoRACallback(hf_token=os.environ.get('HF_TOKEN'), base_repo_name=config["experiment_name"], save_steps=1000),
+    InferenceCallback(tokenizer=tokenizer, dataset=train_dataset, steps=100)
 ]
 
 
@@ -184,7 +240,7 @@ trainer = SFTTrainer(
     args=sft_args,
     train_dataset=train_dataset,
     processing_class=tokenizer,
-    peft_config=peft_config,
+    peft_config=sft_peft_config,
     callbacks=callbacks_list
 )
 
