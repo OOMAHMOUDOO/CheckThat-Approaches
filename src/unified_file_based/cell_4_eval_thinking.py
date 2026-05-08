@@ -43,14 +43,14 @@ config = {
     "model_name": "meta-llama/Llama-3.2-3B-Instruct",
     "experiment_name": "meta-3b-sft-clef-20k",
     "output_dir": "/workspace/qwen3-4b-sft",
-    "gen_batch_size": 256,        # ↑ from 64 (A100 80GB can handle this)
-    "score_batch_size": 1024,     # ↑ from 256 (scoring is memory-light)
-    "max_gen_tokens": 300,        # ↓ from 1024 (profile your data; 95th percentile + margin)
-    "max_seq_length": 2048,
+    "gen_batch_size": 2,        # ↑ from 64 (A100 80GB can handle this)
+    "score_batch_size": 2,     # ↑ from 256 (scoring is memory-light)
+    "max_gen_tokens": 128,        # ↓ from 1024 (profile your data; 95th percentile + margin)
+    "max_seq_length": 2048,       # ↓ from 4096 (since evidence is strictly capped at 500 tokens)
     "is_sanity": False,
     "use_vllm": VLLM_AVAILABLE,   # Auto-enable if available
     "torch_compile": True,        # Enable torch.compile for kernel fusion
-    "flash_attn": True,           # Enable Flash Attention 2
+    "flash_attn": False,           # Enable Flash Attention 2
 }
 
 SYSTEM_PROMPT = (
@@ -155,6 +155,7 @@ def batch_generate_thinking_hf(model, tokenizer, prompts: List[str],
                 eos_token_id=[tokenizer.encode("</think>", add_special_tokens=False)[-1]],  # Stop at </think> token
                 temperature=None,  # Disable sampling overhead
                 top_p=None,
+                repetition_penalty=1.2,  # Prevent repetition loops
             )
         
         prompt_len = batch_inputs["input_ids"].shape[1]
@@ -176,6 +177,7 @@ def batch_generate_thinking_vllm(llm: LLM, prompts: List[str],
         max_tokens=max_new_tokens,
         stop=["</think>"],
         include_stop_str_in_output=True,
+        repetition_penalty=1.2,  # Prevents the model from repeating evidence
     )
     # vLLM handles continuous batching internally; batch_size is just for progress tracking
     outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
@@ -207,14 +209,14 @@ def score_suffixes_batch_optimized(model, tokenizer, batch_prefixes: List[str],
             texts, 
             truncation=True, 
             padding=True,
-            max_length=4096, 
+            max_length=config["max_seq_length"], 
             return_tensors="pt"
         )
         input_ids = encoding["input_ids"].to(device)
         attention_mask = encoding["attention_mask"].to(device)
         
         # Compute prefix length once (same for all suffixes in group)
-        prefix_encoding = tokenizer(prefix, padding=False, truncation=True, max_length=4096)
+        prefix_encoding = tokenizer(prefix, padding=False, truncation=True, max_length=config["max_seq_length"])
         prefix_len = len(prefix_encoding["input_ids"])
         
         with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
@@ -261,10 +263,20 @@ def run_evaluation(model, tokenizer, raw_data: List[Dict], config: Dict,
     print("--- Building Prompts ---")
     all_prompts = []
     all_meta = []
-
+    
     for idx, sample in enumerate(raw_data):
         claim = sample.get("claim", "")
         evidence = " ".join(sample.get("evidences", []))
+        
+        # --- TRUNCATE EVIDENCE TO FIT 1024 TOTAL TOKENS ---
+        # First do a fast word split so we don't pass 10,000 words to the tokenizer
+        words = evidence.split()
+        if len(words) > 700:
+            evidence = " ".join(words[:700])
+            
+        evidence_tokens = tokenizer.encode(evidence, add_special_tokens=False)
+        if len(evidence_tokens) > 500:
+            evidence = tokenizer.decode(evidence_tokens[:500], skip_special_tokens=True) + "..."
 
         for t_idx, trace in enumerate(sample["Reasoning_traces"]):
             justification = remove_label_pattern(trace).split("Label:")[0].strip()
@@ -281,6 +293,10 @@ def run_evaluation(model, tokenizer, raw_data: List[Dict], config: Dict,
             prompt_text = tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
+            
+            # Force the model to start thinking instead of hallucinating evidence
+            prompt_text += "<think>\n"
+            
             all_prompts.append(prompt_text)
             all_meta.append({
                 "sample_idx": idx, "trace_idx": t_idx, "verdict": v.lower(),
@@ -311,14 +327,14 @@ def run_evaluation(model, tokenizer, raw_data: List[Dict], config: Dict,
     flat_suffixes = []
     flat_score_meta = []
 
-    for prompt, thinking, meta in zip(all_prompts, all_thinkings, all_meta):
+    for prompt_idx, (prompt, thinking, meta) in enumerate(zip(all_prompts, all_thinkings, all_meta)):
         prefix = prompt + thinking
         suffixes = get_verdict_suffixes(meta["verdict"])
         for suffix_text, suffix_label in suffixes:
             flat_prefixes.append(prefix)
             flat_suffixes.append(suffix_text)
             flat_score_meta.append({
-                "pair_idx": len(flat_prefixes) - 1,
+                "prompt_idx": prompt_idx,
                 "suffix_label": suffix_label,
                 "is_yes": suffix_text.startswith("\nYes"),
             })
@@ -339,7 +355,7 @@ def run_evaluation(model, tokenizer, raw_data: List[Dict], config: Dict,
     print("\n--- Phase 4: Aggregating Results ---")
     pair_scores = defaultdict(list)
     for score, smeta in zip(all_scores, flat_score_meta):
-        pair_scores[smeta["pair_idx"]].append({
+        pair_scores[smeta["prompt_idx"]].append({
             "label": smeta["suffix_label"],
             "score": score,
             "is_yes": smeta["is_yes"],
@@ -349,8 +365,8 @@ def run_evaluation(model, tokenizer, raw_data: List[Dict], config: Dict,
     sample_yes_scores = [[] for _ in range(len(raw_data))]
     sample_thinkings = [[] for _ in range(len(raw_data))]
 
-    for pair_idx, scores_list in pair_scores.items():
-        meta = all_meta[pair_idx]
+    for prompt_idx, scores_list in pair_scores.items():
+        meta = all_meta[prompt_idx]
         s_idx = meta["sample_idx"]
         scores_tensor = torch.tensor([item["score"] for item in scores_list])
         probs = torch.softmax(scores_tensor, dim=0).tolist()
@@ -360,7 +376,7 @@ def run_evaluation(model, tokenizer, raw_data: List[Dict], config: Dict,
             sample_votes[s_idx][label] += probs[i]
             if item["is_yes"]:
                 sample_yes_scores[s_idx].append(probs[i])
-        sample_thinkings[s_idx].append(all_thinkings[pair_idx])
+        sample_thinkings[s_idx].append(all_thinkings[prompt_idx])
 
     # ----- Step 6: Build final predictions -----
     predictions = []
@@ -416,8 +432,8 @@ if __name__ == "__main__":
 
     # Checkpoint selection (simplified)
     print("--- LoRA Checkpoint Selection ---")
-    latest_checkpoint = find_latest_checkpoint(config["output_dir"], config["experiment_name"])
-    chosen_adapter = latest_checkpoint or os.path.join(config["output_dir"], config["experiment_name"])
+    latest_checkpoint = "Mahmoud669401/meta-3b-sft-clef-20k" #find_latest_checkpoint(config["output_dir"], config["experiment_name"])
+    chosen_adapter = latest_checkpoint #or os.path.join(config["output_dir"], config["experiment_name"])
     print(f"Using checkpoint: {chosen_adapter}")
 
     # --- Load tokenizer ---
@@ -457,8 +473,9 @@ if __name__ == "__main__":
             model=config["model_name"],
             tensor_parallel_size=1,  # Use 1 GPU; scale up if multi-GPU
             dtype="bfloat16",
-            max_model_len=4096,
+            max_model_len=config["max_seq_length"],
             enable_prefix_caching=True,  # Reuse KV cache across similar prompts
+            gpu_memory_utilization=0.5
         )
         # Apply LoRA to vLLM if needed (vLLM supports LoRA serving)
         if chosen_adapter and os.path.exists(chosen_adapter):
@@ -472,19 +489,34 @@ if __name__ == "__main__":
         test_raw = test_raw[:10]
         print("Sanity mode: using first 10 samples")
 
-    # --- Run evaluation ---
-    predictions = run_evaluation(model, tokenizer, test_raw, config, llm=llm)
-
-    # --- Save results ---
+    # --- Run evaluation in chunks and save incrementally ---
     rand_num = random.randint(1000, 9999)
     adapter_name = os.path.basename(chosen_adapter) if chosen_adapter else "base"
     backend = "vllm" if config["use_vllm"] else "hf"
     output_path = f"/workspace/clef_predictions_thinking_{rand_num}_{adapter_name}_{backend}.json"
-    
-    with open(output_path, "w") as f:
-        json.dump(predictions, f, indent=2)  # indent=2 saves space vs indent=4
+    print(f"Results will be saved incrementally to: {output_path}")
 
-    print(f"\n✅ Evaluation complete. Results saved to: {output_path}")
+    all_predictions = []
+    chunk_size = 200  # 200 items (each containing multiple reasoning traces)
+    for i in range(0, len(test_raw), chunk_size):
+        chunk_data = test_raw[i:i + chunk_size]
+        print(f"\n=============================================")
+        print(f"Processing Chunk {i//chunk_size + 1} of {(len(test_raw) + chunk_size - 1)//chunk_size}")
+        print(f"=============================================")
+        
+        chunk_preds = run_evaluation(model, tokenizer, chunk_data, config, llm=llm)
+        
+        for p in chunk_preds:
+            p["query_id"] = len(all_predictions)
+            all_predictions.append(p)
+            
+        with open(output_path, "w") as f:
+            json.dump(all_predictions, f, indent=2)
+            
+        print(f"✅ Chunk {i//chunk_size + 1} saved! Total predictions so far: {len(all_predictions)}")
+
+    predictions = all_predictions
+    print(f"\n✅ Evaluation complete. Final results saved to: {output_path}")
     print(f"Produced {len(predictions)} predictions.")
 
     # Quick accuracy check
